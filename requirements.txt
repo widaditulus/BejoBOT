@@ -1,0 +1,7 @@
+python-telegram-bot==20.3
+pandas
+numpy
+requests
+scikit-learn
+xgboost
+joblib
