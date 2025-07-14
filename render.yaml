@@ -2,8 +2,7 @@ services:
   - type: web
     name: bejobot
     env: python
-    region: oregon
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bejo.py
+    buildCommand: "pip install --no-cache-dir -r requirements.txt"
+    startCommand: "uvicorn main:app --host=0.0.0.0 --port=10000"
     pythonVersion: 3.11
+    autoDeploy: true
