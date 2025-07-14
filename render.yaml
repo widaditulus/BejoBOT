@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: bejobot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bejo.py
+    pythonVersion: 3.11
