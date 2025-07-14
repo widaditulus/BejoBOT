@@ -1,18 +1,17 @@
 import os
-import re
-import csv
 import logging
-import requests
-import numpy as np
 import pandas as pd
-from io import StringIO
-from datetime import datetime, timedelta
+import numpy as np
+from datetime import datetime
 from itertools import permutations
+
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.naive_bayes import GaussianNB
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
 import joblib
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
@@ -20,7 +19,7 @@ from telegram.ext import (
 )
 
 # ====== CONFIG ======
-TOKEN = "7951498360:AAFvCovBQivTjTWe53VO-Lsr7B7FsHXhGCI"
+TOKEN = "7951498360:AAFvCovBQivTjTWe53VO-Lsr7B7FsHXhGCI"  # Ganti token bot kamu
 PASARAN_MAP = {
     "sgp": "https://raw.githubusercontent.com/widaditulus/4D/main/sgp.csv",
     "hk": "https://raw.githubusercontent.com/widaditulus/4D/main/hk.csv",
@@ -31,66 +30,109 @@ PASARAN_MAP = {
     "magnum": "https://raw.githubusercontent.com/widaditulus/4D/main/magnum.csv"
 }
 LOG_DIR = "logs"
-PRED_LOG_FILE = os.path.join(LOG_DIR, "prediction_log.csv")
-EVAL_LOG_FILE = os.path.join(LOG_DIR, "evaluation_log.csv")
 os.makedirs(LOG_DIR, exist_ok=True)
-
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO
+)
 
 POSITIONS = ['AS', 'CP', 'KP', 'EK']
-PASARAN_DEFAULT = 'sgp'
-MODEL_PATH_TEMPLATE = "model_{model}_{pos}.pkl"
 MODEL_LIST = ['xgb', 'rf', 'nb', 'dt']
+MODEL_PATH_TEMPLATE = "model_{model}_{pos}.pkl"
+PASARAN_DEFAULT = "sgp"
 
-# ====== DATA LOADING ======
-def load_data(url):
+# ====== DATA LOAD & PREPROCESS ======
+def load_and_clean_data(url):
     try:
-        r = requests.get(url)
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text))
-        df.columns = ['tanggal', 'angka']
-        df['tanggal'] = pd.to_datetime(df['tanggal'])
-        df = df.tail(500)
-        df['angka_str'] = df['angka'].astype(str).str.zfill(5)  # 5 digit angka main
-        return df
+        df = pd.read_csv(url)
+        # Pastikan ada kolom tanggal dan angka
+        if 'tanggal' not in df.columns or 'angka' not in df.columns:
+            # Jika format beda, coba sesuaikan di sini
+            df.columns = ['tanggal', 'angka']
+        df['tanggal'] = pd.to_datetime(df['tanggal'], errors='coerce')
+        df = df.dropna(subset=['tanggal'])
+        df = df.dropna(subset=['angka'])
+        # Format angka jadi string 4 digit (jika 4D) atau 5 digit
+        df['angka_str'] = df['angka'].astype(str).str.zfill(4)
+        # Filter yang valid (4 digit angka)
+        df = df[df['angka_str'].str.match(r'^\d{4}$')]
+        df = df.drop_duplicates(subset=['tanggal']).sort_values('tanggal')
+        return df.reset_index(drop=True)
     except Exception as e:
         logging.error(f"Load data error: {e}")
         return pd.DataFrame()
 
-# ====== FEATURE EXTRACTION ======
-def extract_features(df):
-    df['hari'] = df['tanggal'].dt.dayofweek
-    df['minggu'] = df['tanggal'].dt.isocalendar().week
-    X = []
-    y_map = {pos: [] for pos in POSITIONS}
-    for _, row in df.iterrows():
-        x_row = [row['hari'], row['minggu']]
-        for d in row['angka_str']:
-            x_row.append(int(d))
-        X.append(x_row)
-        for i, pos in enumerate(POSITIONS):
-            y_map[pos].append(int(row['angka_str'][i]))
-    return np.array(X), y_map
+def add_lag_features(df, n_lag=3):
+    for pos_idx, pos in enumerate(POSITIONS):
+        for lag in range(1, n_lag + 1):
+            df[f'{pos}_lag{lag}'] = df['angka_str'].shift(lag).apply(
+                lambda x: int(x[pos_idx]) if pd.notnull(x) else -1
+            )
+    df = df.dropna().reset_index(drop=True)
+    return df
 
-# ====== TRAIN MODEL ======
+def extract_features_targets(df):
+    features = []
+    targets = {pos: [] for pos in POSITIONS}
+    for _, row in df.iterrows():
+        x = [
+            row['tanggal'].dayofweek,
+            row['tanggal'].isocalendar().week
+        ]
+        for pos in POSITIONS:
+            for lag in range(1, 4):
+                x.append(row[f'{pos}_lag{lag}'])
+        features.append(x)
+        for i, pos in enumerate(POSITIONS):
+            targets[pos].append(int(row['angka_str'][i]))
+    return np.array(features), targets
+
+# ====== TRAINING ======
 def train_all_models(df):
-    X, y_map = extract_features(df)
+    X, y_map = extract_features_targets(df)
+    if X.shape[0] < 10:
+        logging.warning("Data terlalu sedikit untuk training.")
+        return
+
     for pos in POSITIONS:
         y = np.array(y_map[pos])
+        # Pastikan label mulai dari 0 (XGB harus 0-based)
+        y -= y.min()
+
+        if len(set(y)) < 2:
+            logging.warning(f"Label untuk posisi {pos} kurang variatif.")
+            continue
+
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+        except Exception as e:
+            logging.error(f"Train-test split error pada posisi {pos}: {e}")
+            continue
+
         for model_name in MODEL_LIST:
-            model = None
             if model_name == 'xgb':
-                model = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss')
+                model = XGBClassifier(
+                    use_label_encoder=False,
+                    eval_metric='mlogloss',
+                    objective='multi:softprob',
+                    num_class=10,
+                    verbosity=0,
+                    random_state=42
+                )
             elif model_name == 'rf':
-                model = RandomForestClassifier()
+                model = RandomForestClassifier(n_estimators=100, random_state=42)
             elif model_name == 'nb':
                 model = GaussianNB()
             elif model_name == 'dt':
-                model = DecisionTreeClassifier()
-            model.fit(X, y)
+                model = DecisionTreeClassifier(random_state=42)
+
+            model.fit(X_train, y_train)
+            acc = model.score(X_test, y_test)
+            logging.info(f"Model {model_name} Posisi {pos} - Akurasi test: {acc*100:.2f}%")
             joblib.dump(model, MODEL_PATH_TEMPLATE.format(model=model_name, pos=pos))
 
-# ====== LOAD MODELS ======
+# ====== MODEL LOAD ======
 def load_models():
     models = {pos: {} for pos in POSITIONS}
     for pos in POSITIONS:
@@ -100,302 +142,182 @@ def load_models():
                 models[pos][model_name] = joblib.load(path)
     return models
 
-# ====== HYBRID PREDICT ======
+# ====== HYBRID PREDIKSI ======
 def hybrid_predict(models, X):
     pred_digit = {}
     am_digits = {pos: [] for pos in POSITIONS}
     for pos in POSITIONS:
-        votes = []
+        prob_agg = np.zeros(10)
+        total_models = 0
         for model_name in MODEL_LIST:
             model = models[pos].get(model_name)
             if model:
-                pred = model.predict(X)[0]
-                votes.append(pred)
-        if votes:
-            # Voting sekaligus dapat 3 top digit terbanyak (frekuensi suara)
-            from collections import Counter
-            c = Counter(votes)
-            top3 = [d for d, _ in c.most_common(3)]
+                if hasattr(model, "predict_proba"):
+                    prob = model.predict_proba(X)[0]
+                else:
+                    # Jika model tidak ada predict_proba (misal NB kadang)
+                    pred = model.predict(X)[0]
+                    prob = np.eye(10)[pred]
+                prob_agg += prob
+                total_models += 1
+        if total_models > 0:
+            prob_agg /= total_models
+            top3 = prob_agg.argsort()[-3:][::-1].tolist()
             am_digits[pos] = top3
             pred_digit[pos] = top3[0]
         else:
             pred_digit[pos] = -1
-            am_digits[pos] = []
+            am_digits[pos] = [0, 0, 0]
     return pred_digit, am_digits
 
-# ====== COLOK NAGA 3D & ANGKA MAIN 5 DIGIT ======
-def generate_colok_naga_3d(hasil):
-    # kombinasi 3 digit dari hasil posisi (4 posisi) => ambil 3 digit teratas tiap posisi dan generate kombinasi 3 digit
-    candidates = []
-    for combo in permutations([hasil['AS'], hasil['CP'], hasil['KP'], hasil['EK']], 3):
-        # combo contoh: (AS, CP, KP)
-        candidates.append(''.join(str(d) for d in combo))
-    # Hapus duplikat dan urutkan
-    candidates = sorted(set(candidates))
-    return candidates[:5]  # Maksimal 5 digit colok naga
+# ====== FORMAT OUTPUT ======
+def generate_colok_naga_3d(am_dict):
+    digits = [am_dict.get(pos, [0])[0] for pos in POSITIONS]
+    combos = set()
+    for combo in permutations(digits, 3):
+        combos.add(''.join(str(d) for d in combo))
+    return sorted(combos)[:3]
 
-# ====== LOGGING ======
-def simpan_log(pasaran, cb, am, cn, actual=''):
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with open(PRED_LOG_FILE, 'a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([now, pasaran, cb, '|'.join(str(d) for d in am['AS']),
-                         '|'.join(str(d) for d in am['CP']),
-                         '|'.join(str(d) for d in am['KP']),
-                         '|'.join(str(d) for d in am['EK']),
-                         ','.join(cn),
-                         actual])
+def format_output(cb, am, cn, posisi_detail):
+    cb_str = str(cb)
+    am_str = ', '.join(str(d) for d in am)
+    cn_str = '\n'.join(', '.join(list(c)) for c in cn)
+    pos_str = '\n'.join([f"{pos}: {', '.join(str(d) for d in posisi_detail.get(pos, [])[:3])}" for pos in POSITIONS])
+    return f"CB: {cb_str}\nAM: {am_str}\n\nCN:\n{cn_str}\n\n{pos_str}"
 
-def load_feedback():
-    if not os.path.exists(PRED_LOG_FILE):
-        return pd.DataFrame()
-    df = pd.read_csv(PRED_LOG_FILE, header=None,
-                     names=['timestamp', 'pasaran', 'cb', 'am_AS', 'am_CP', 'am_KP', 'am_EK', 'cn', 'actual'],
-                     dtype=str, na_filter=False)
-    return df
-
-# ====== HITUNG AKURASI ======
-def hitung_akurasi(prediksi, actual):
-    if not prediksi or not actual or len(prediksi) != len(actual):
-        return 0.0
-    benar = sum(p == a for p, a in zip(prediksi, actual))
-    return round(benar / len(prediksi) * 100, 2)
-
-# ====== LAPORAN AKURASI MINGGUAN ======
-def laporan_akurasi_mingguan(pasaran):
-    if not os.path.exists(EVAL_LOG_FILE):
-        return f"Tidak ada data evaluasi untuk pasaran {pasaran.upper()}."
-    df = pd.read_csv(EVAL_LOG_FILE, header=None,
-                     names=['timestamp', 'pasaran', 'tanggal_prediksi', 'prediksi', 'actual', 'akurasi'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    seminggu_lalu = datetime.now() - timedelta(days=7)
-    df = df[(df['pasaran'] == pasaran) & (df['timestamp'] >= seminggu_lalu)]
-    if df.empty:
-        return f"Tidak ada data evaluasi minggu ini untuk pasaran {pasaran.upper()}."
-    rata2 = df['akurasi'].astype(float).mean()
-    hasil_baik = df[df['akurasi'] >= 75].shape[0]
-    total = df.shape[0]
-    return (f"Laporan akurasi minggu ini untuk {pasaran.upper()} ({total} prediksi):\n"
-            f"Rata-rata akurasi digit: {rata2:.2f}%\n"
-            f"Prediksi dengan akurasi ≥ 75%: {hasil_baik}")
-
-# ====== RETRAIN DENGAN FEEDBACK ======
-def retrain_with_feedback(pasaran):
-    df = load_data(PASARAN_MAP[pasaran])
-    if df.empty:
-        return None
-    feedback_df = load_feedback()
-    if not feedback_df.empty:
-        for _, row in feedback_df.iterrows():
-            try:
-                dt = pd.to_datetime(row['timestamp']).date()
-                angka = row['actual']
-                if len(angka) == 5 and angka.isdigit():
-                    if dt not in df['tanggal'].dt.date.values:
-                        df = df.append({'tanggal': dt, 'angka': int(angka), 'angka_str': angka.zfill(5)}, ignore_index=True)
-            except Exception as e:
-                logging.error(f"Error saat update feedback ke data training: {e}")
-    df.drop_duplicates(subset=['tanggal'], keep='last', inplace=True)
-    df.sort_values(by='tanggal', inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    train_all_models(df)
-    return load_models()
-
-# ====== COMMAND HANDLERS ======
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ====== HANDLER ======
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔥 Bot Prediksi 4D Hybrid 🔥\n"
-        "Perintah:\n"
-        "/predict [pasaran] - Prediksi 5 digit lengkap\n"
-        "/p [pasaran] [YYMMDD] - Prediksi dengan tanggal\n"
-        "/input [pasaran] [YYMMDD] [angka] - Input hasil undian 5 digit\n"
-        "/train [pasaran] - Latih ulang model\n"
-        "/feedback [pasaran] - Tampilkan akurasi minggu ini\n"
-        "/help - Bantuan"
+        "Halo! Kirim perintah /p [pasaran] [DDMMYY] untuk prediksi.\n"
+        "Contoh: /p sgp 120725\n"
+        "Untuk training model: /train [pasaran]\n"
+        "Untuk input data manual: /input [pasaran] [tanggal DDMMYY] [angka 4 digit]\n"
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Perintah:\n"
-        "/predict [pasaran] - Prediksi 5 digit\n"
-        "/p [pasaran] [YYMMDD] - Prediksi dengan tanggal\n"
-        "/input [pasaran] [YYMMDD] [angka] - Input hasil undian 5 digit\n"
-        "/train [pasaran] - Latih ulang model\n"
-        "/feedback [pasaran] - Tampilkan akurasi minggu ini\n"
-        "Pasaran tersedia: " + ", ".join(PASARAN_MAP.keys())
-    )
-
-async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pasaran = PASARAN_DEFAULT
-    if context.args:
-        p = context.args[0].lower()
-        if p in PASARAN_MAP:
-            pasaran = p
-        else:
-            await update.message.reply_text(f"Pasaran '{p}' tidak dikenal, gunakan default {pasaran}.")
-    await update.message.reply_text(f"Training ulang semua posisi untuk {pasaran.upper()}... tunggu ya...")
-    train_all_models(load_data(PASARAN_MAP[pasaran]))
-    await update.message.reply_text("Training selesai, semua model tersimpan.")
-
-async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pasaran = PASARAN_DEFAULT
-    tanggal = None
-    if context.args:
-        p = context.args[0].lower()
-        if p in PASARAN_MAP:
-            pasaran = p
-        else:
-            await update.message.reply_text(f"Pasaran '{p}' tidak dikenal, gunakan default {pasaran}.")
-            return
-        if len(context.args) > 1:
-            try:
-                tanggal = datetime.strptime(context.args[1], "%y%m%d").date()
-            except:
-                await update.message.reply_text("Format tanggal salah. Gunakan YYMMDD.")
-                return
-    df = load_data(PASARAN_MAP[pasaran])
-    if df.empty:
-        await update.message.reply_text("Gagal memuat data.")
-        return
-    models = load_models()
-    if not models:
-        await update.message.reply_text("Model belum dilatih. Gunakan /train terlebih dahulu.")
-        return
-    X_all, _ = extract_features(df)
-    X_input = X_all[-1].reshape(1, -1)
-    hasil, am = hybrid_predict(models, X_input)
-    hasil_str = ''.join(str(hasil[pos]) for pos in POSITIONS)
-    # AM gabungkan jadi string format 5 digit total
-    am_list = []
-    for pos in POSITIONS:
-        am_list.extend([str(d) for d in am[pos]])
-    am_str = ', '.join(am_list)
-    cn_list = generate_colok_naga_3d(hasil)
-    # Format CN seperti permintaan (3 digit per baris, maksimal 5 baris)
-    cn_formatted = ''
-    for i, cn in enumerate(cn_list):
-        cn_formatted += ', '.join(list(cn)) + ',\n'
-        if i >= 4:
-            break
-    msg = (
-        f"CB: {hasil_str[0]}\n"
-        f"AM: {am_str}\n\n"
-        "CN:\n"
-        f"{cn_formatted}\n"
-    )
-    # Detail posisi
-    for pos in POSITIONS:
-        msg += f"{pos}: {', '.join(str(d) for d in am[pos])}\n"
-    await update.message.reply_text(msg)
-    simpan_log(pasaran, hasil_str[0], am, cn_list)
-
-async def p_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Alias /p sama dengan /predict
-    await predict_command(update, context)
-
-async def input_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Format: /input [pasaran] [YYMMDD] [angka 5 digit]
-    if len(context.args) != 3:
-        await update.message.reply_text(
-            "Format salah! Gunakan:\n"
-            "/input [pasaran] [YYMMDD] [angka 5 digit]\n"
-            "Contoh: /input sgp 130725 45678"
-        )
-        return
-    pasaran = context.args[0].lower()
+async def train_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    pasaran = args[0].lower() if args else PASARAN_DEFAULT
     if pasaran not in PASARAN_MAP:
         await update.message.reply_text(f"Pasaran '{pasaran}' tidak dikenal.")
         return
-    tanggal_str = context.args[1]
-    angka = context.args[2]
-    if not re.match(r'^\d{6}$', tanggal_str):
-        await update.message.reply_text("Tanggal harus 6 digit format YYMMDD.")
-        return
-    if not re.match(r'^\d{5}$', angka):
-        await update.message.reply_text("Angka harus 5 digit.")
-        return
-    try:
-        tanggal = datetime.strptime(tanggal_str, "%y%m%d").date()
-    except Exception:
-        await update.message.reply_text("Format tanggal salah. Gunakan YYMMDD.")
-        return
-    angka = angka.zfill(5)
-    # Simpan hasil aktual ke log prediksi (kolom actual)
-    try:
-        with open(PRED_LOG_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            writer.writerow([now, pasaran, '', '', '', '', '', '', '', angka])
-        await update.message.reply_text(f"Hasil undian {pasaran.upper()} tanggal {tanggal_str} = {angka} berhasil disimpan.\nModel akan retrain otomatis sekarang.")
-    except Exception as e:
-        await update.message.reply_text(f"Gagal menyimpan hasil: {e}")
-        return
-    # Auto-retrain
-    models = retrain_with_feedback(pasaran)
-    if models:
-        await update.message.reply_text("Retrain model selesai setelah input data baru.")
-    else:
-        await update.message.reply_text("Retrain gagal, cek log.")
 
-async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(f"Gunakan: /feedback [pasaran]\nContoh: /feedback hk")
-        return
-
-    pasaran = context.args[0].lower()
-    if pasaran not in PASARAN_MAP:
-        await update.message.reply_text(f"Pasaran '{pasaran}' tidak dikenal. Pilih dari: {', '.join(PASARAN_MAP.keys())}")
-        return
-
-    if not os.path.exists(EVAL_LOG_FILE):
-        await update.message.reply_text(f"Tidak ada data evaluasi untuk pasaran {pasaran.upper()}.")
-        return
-
-    df = pd.read_csv(EVAL_LOG_FILE, header=None,
-                     names=['timestamp', 'pasaran', 'tanggal_prediksi', 'prediksi', 'actual', 'akurasi'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    seminggu_lalu = datetime.now() - timedelta(days=7)
-    df = df[(df['pasaran'] == pasaran) & (df['timestamp'] >= seminggu_lalu)]
+    await update.message.reply_text(f"Mulai training model untuk {pasaran.upper()}...")
+    df = load_and_clean_data(PASARAN_MAP[pasaran])
     if df.empty:
-        await update.message.reply_text(f"Tidak ada data evaluasi minggu ini untuk pasaran {pasaran.upper()}.")
+        await update.message.reply_text(f"Data pasaran {pasaran.upper()} kosong, training dibatalkan.")
+        return
+    df = add_lag_features(df)
+    train_all_models(df)
+    await update.message.reply_text("Training selesai dan model sudah tersimpan.")
+
+# Fungsi input data manual via bot
+DATA_MANUAL = {}  # format: {pasaran: pd.DataFrame}
+
+async def input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) != 3:
+        await update.message.reply_text("Format salah. Gunakan: /input [pasaran] [tanggal DDMMYY] [angka 4 digit]")
+        return
+    pasaran = args[0].lower()
+    tanggal_str = args[1]
+    angka = args[2]
+    if pasaran not in PASARAN_MAP:
+        await update.message.reply_text(f"Pasaran '{pasaran}' tidak dikenal.")
+        return
+    try:
+        tanggal = datetime.strptime(tanggal_str, "%d%m%y")
+    except:
+        await update.message.reply_text("Format tanggal salah. Gunakan DDMMYY.")
+        return
+    if not angka.isdigit() or len(angka) != 4:
+        await update.message.reply_text("Angka harus 4 digit angka.")
         return
 
-    rata2 = df['akurasi'].astype(float).mean()
-    hasil_baik = df[df['akurasi'] >= 75].shape[0]
-    total = df.shape[0]
-    await update.message.reply_text(
-        f"Laporan akurasi minggu ini untuk {pasaran.upper()} ({total} prediksi):\n"
-        f"Rata-rata akurasi digit: {rata2:.2f}%\n"
-        f"Prediksi dengan akurasi ≥ 75%: {hasil_baik}"
-    )
+    # Ambil data manual atau buat baru
+    df_manual = DATA_MANUAL.get(pasaran)
+    if df_manual is None:
+        # Ambil data asli dari URL
+        df_manual = load_and_clean_data(PASARAN_MAP[pasaran])
 
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Perintah tidak dikenal.\n"
-        "Gunakan salah satu perintah berikut:\n"
-        "/predict sgp\n"
-        "/p sgp 250713\n"
-        "/input sgp 130725 45678\n"
-        "/train sgp\n"
-        "/feedback sgp\n"
-    )
+    # Update data manual dengan input baru
+    new_row = pd.DataFrame({'tanggal': [tanggal], 'angka_str': [angka]})
+    df_manual = pd.concat([df_manual, new_row], ignore_index=True)
+    df_manual = df_manual.drop_duplicates(subset=['tanggal']).sort_values('tanggal').reset_index(drop=True)
+    DATA_MANUAL[pasaran] = df_manual
 
+    await update.message.reply_text(f"Data untuk {pasaran.upper()} tanggal {tanggal.strftime('%d-%m-%Y')} berhasil ditambahkan/diupdate.")
+
+async def prepare_features_for_prediction(row):
+    x = [
+        row['tanggal'].dayofweek,
+        row['tanggal'].isocalendar().week
+    ]
+    for pos_idx, pos in enumerate(POSITIONS):
+        for lag in range(1, 4):
+            x.append(int(row[f'{pos}_lag{lag}']) if f'{pos}_lag{lag}' in row else 0)
+    return np.array(x).reshape(1, -1)
+
+async def prediksi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    pasaran = PASARAN_DEFAULT
+    tanggal_str = None
+
+    if len(args) >= 1:
+        pasaran = args[0].lower()
+    if len(args) == 2:
+        tanggal_str = args[1]
+
+    if pasaran not in PASARAN_MAP:
+        await update.message.reply_text(f"Pasaran '{pasaran}' tidak dikenali.")
+        return
+
+    # Pakai data manual kalau ada, kalau tidak ambil dari URL
+    df = DATA_MANUAL.get(pasaran)
+    if df is None:
+        df = load_and_clean_data(PASARAN_MAP[pasaran])
+
+    if df.empty:
+        await update.message.reply_text(f"Data pasaran {pasaran.upper()} kosong, silakan coba lagi nanti.")
+        return
+
+    if tanggal_str:
+        try:
+            tanggal = datetime.strptime(tanggal_str, "%d%m%y").date()
+        except ValueError:
+            await update.message.reply_text("Format tanggal salah. Gunakan DDMMYY, contoh: 120725.")
+            return
+    else:
+        tanggal = df['tanggal'].max().date()
+
+    if tanggal not in df['tanggal'].dt.date.values:
+        await update.message.reply_text(f"Data untuk tanggal {tanggal.strftime('%d-%m-%Y')} tidak tersedia.")
+        return
+
+    df = add_lag_features(df)
+    row = df[df['tanggal'].dt.date == tanggal].iloc[0]
+
+    features = await prepare_features_for_prediction(row)
+    models = load_models()
+    pred_digit, am_digits = hybrid_predict(models, features)
+
+    cb = ''.join(str(pred_digit[pos]) for pos in POSITIONS)
+    am = [am_digits[pos][0] for pos in POSITIONS]
+    cn = generate_colok_naga_3d(am_digits)
+    output_text = format_output(cb, am, cn, am_digits)
+
+    await update.message.reply_text(f"Prediksi {pasaran.upper()} untuk tanggal {tanggal.strftime('%d-%m-%Y')}:\n\n{output_text}")
+
+# ====== MAIN ======
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("train", train_command))
-    app.add_handler(CommandHandler("predict", predict_command))
-    app.add_handler(CommandHandler("p", p_command))
-    app.add_handler(CommandHandler("input", input_command))
-    app.add_handler(CommandHandler("feedback", feedback_command))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CommandHandler("train", train_handler))
+    application.add_handler(CommandHandler("p", prediksi_handler))
+    application.add_handler(CommandHandler("input", input_handler))
 
     logging.info("Bot started...")
-    app.run_polling()
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
-
